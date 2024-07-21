@@ -1,0 +1,252 @@
+#include <Arduino.h>
+
+#define PUL_PIN 25 // Pulse pin
+#define DIR_PIN 32 // Direction pin
+#define ENA_PIN 33 // Enable pin
+
+// #define EA_PLUS_PIN 16   // Example pin for EA+
+// #define EA_MINUS_PIN 17  // Example pin for EA-
+// #define EB_PLUS_PIN 18   // Example pin for EB+
+// #define EB_MINUS_PIN 19  // Example pin for EB-
+
+#define HIGHDUR 20 //duration in microsec for hihg pulse (20 for T=40, f=25kHz at 50% duty)
+#define LOWDUR  20 //duration in microsec for hihg pulse
+#define DELAYDUR 100 //pause after mode changes
+#define NUMLOOPS 1 //number of up-down cycles in loop mode
+#define NUMROT 5 //number of rotations per iterations (up or down); 5 ~= 1" (5.08 rotations for 5mm pitch = 1")
+
+volatile int encoderCount = 0;  //the relative position in mm
+volatile long lastUpdateTime = 0;
+volatile long lastEncoderCount = 0;
+// volatile float speed = 0.0;
+
+//STATE MACHINE MODES
+const int MODE_UP = 1;
+const int MODE_DOWN = 2;
+const int MODE_LOOP = 3;
+const int MODE_STOP = 4;
+const int MODE_HOLD = 5;
+int currentMode = MODE_STOP; // Default to STOP model
+
+//MOTOR SETUP
+const int microsteps = 4; // Number of microsteps per step
+const int stepsPerRevolution = 200; // Full steps per revolution for your motor
+
+//function declarations
+void setup();
+void loop();
+void modeUpFunction();
+void modeDownFunction();
+void modeLoopFunction();
+void modeStopFunction();
+void modeHoldFunction();
+void updatePosition(int);
+void gotoPosition(int);
+bool isNumber(String);
+
+
+void setup() {
+  //control pins
+  pinMode(PUL_PIN, OUTPUT);
+  pinMode(DIR_PIN, OUTPUT);
+  pinMode(ENA_PIN, OUTPUT);
+
+  //encoder pins - must be interupt pins
+  // pinMode(EA_PLUS_PIN, INPUT_PULLUP);
+  // pinMode(EA_MINUS_PIN, INPUT_PULLUP);
+  // pinMode(EB_PLUS_PIN, INPUT_PULLUP);
+  // pinMode(EB_MINUS_PIN, INPUT_PULLUP);
+
+  // attachInterrupt(digitalPinToInterrupt(EA_PLUS_PIN), updateEncoder, CHANGE);
+  // attachInterrupt(digitalPinToInterrupt(EB_PLUS_PIN), updateEncoder, CHANGE);
+  
+  digitalWrite(ENA_PIN, LOW); // Enable the driver (active low)
+  // Initialize serial communication at 9600 baud rate
+  Serial.begin(115200);
+  Serial.println("Enter 'U', 'D', 'L', 'S', or 'H' to change modes.");
+}
+
+void loop() {
+
+  //processing encoder data
+  unsigned long currentTime = millis();
+  unsigned long elapsedTime = currentTime - lastUpdateTime;
+  
+  if (elapsedTime >= 1000) { // Calculate speed every second
+    // noInterrupts();
+    // speed = ((encoderCount - lastEncoderCount) * 60000.0) / (elapsedTime * 1000.0); // RPM
+    // lastEncoderCount = encoderCount;
+    // lastUpdateTime = currentTime;
+    // interrupts();
+    
+    Serial.print("Position (mm): ");
+    Serial.print(encoderCount);
+    // Serial.print(" Speed: ");
+    // Serial.print(speed);
+    // Serial.println(" RPM");
+  }
+  //----end encoder-----
+
+  // Check if data is available to read
+  if (Serial.available() > 0) {
+    // Read the incoming data
+    String input = Serial.readStringUntil('\n');
+    input.trim();  // Remove any leading or trailing whitespace
+
+    // Change mode based on input
+    if(isNumber(input)){
+      currentMode = MODE_STOP;
+      gotoPosition(input.toInt());
+    }else if (input.equalsIgnoreCase("U")) {
+      currentMode = MODE_UP;
+      Serial.println("Changed to Mode UP");
+    } else if (input.equalsIgnoreCase("D")) {
+      currentMode = MODE_DOWN;
+      Serial.println("Changed to Mode DOWN");
+    } else if (input.equalsIgnoreCase("L")) {
+      currentMode = MODE_LOOP;
+      Serial.println("Changed to Mode LOOP");
+    } else if (input.equalsIgnoreCase("S")) {
+      currentMode = MODE_STOP;
+      Serial.println("Changed to Mode STOP");
+    } else if (input.equalsIgnoreCase("H")) {
+      currentMode = MODE_HOLD;
+      Serial.println("Changed to Mode HOLD");
+    } else {
+      Serial.println("Unknown command. Please enter 'U', 'D', 'L', 'S', or 'H'.");
+    }
+  }
+  // ------ end serial read for mode change -----
+
+  // State machine handling different modes
+  switch (currentMode) {
+    case MODE_UP:
+      modeUpFunction();
+      break;
+    case MODE_DOWN:
+      modeDownFunction();
+      break;
+    case MODE_LOOP:
+      modeLoopFunction();
+      break;
+    case MODE_STOP:
+      modeStopFunction();
+      break;
+    case MODE_HOLD:
+      modeHoldFunction();
+      break;
+    default:
+      Serial.println("Invalid mode");
+      break;
+  }
+
+}
+
+void modeUpFunction() {
+  // Code for mode UP
+  Serial.println(" (UP)");
+  // Set direction
+  digitalWrite(DIR_PIN, HIGH); // Set direction to clockwise
+  for (int i = 0; i < (NUMROT * stepsPerRevolution * microsteps); i++) { // Total microsteps
+    digitalWrite(PUL_PIN, HIGH);
+    delayMicroseconds(HIGHDUR); // Adjust as needed for your motor and driver
+    digitalWrite(PUL_PIN, LOW);
+    delayMicroseconds(LOWDUR);
+  }
+  updatePosition(NUMROT*5);
+  delay(DELAYDUR);  // Pause
+}
+
+void modeDownFunction() {
+  // Code for mode DOWN
+  Serial.println(" (DOWN)");
+    // Change direction
+  digitalWrite(DIR_PIN, LOW); // Set direction to counterclockwise
+  for (int i = 0; i < (NUMROT * stepsPerRevolution * microsteps); i++) { // Total microsteps
+    digitalWrite(PUL_PIN, HIGH);
+    delayMicroseconds(HIGHDUR);
+    digitalWrite(PUL_PIN, LOW);
+    delayMicroseconds(LOWDUR);
+  }
+  updatePosition(-5*NUMROT);
+  delay(DELAYDUR); // Pause
+}
+
+void modeLoopFunction() {
+  // Code for mode LOOP
+  Serial.println(" (LOOP)");
+  for (int i = 0; i < NUMLOOPS; i++) { // Total microsteps
+    modeUpFunction();
+    modeDownFunction();
+  }
+  delay(DELAYDUR); // Pause
+}
+
+void modeStopFunction() {
+  // Code for mode STOP
+  Serial.println(" (STOP)");
+  delay(1000);  // Pause
+}
+
+void modeHoldFunction() {
+  // Code for mode HOLD
+  Serial.println("Executing Mode HOLD - not programmed");
+  delay(1000);  // Simulate work being done in this mode
+}
+
+//update the encoder position following movement
+void updatePosition(int change) {
+  encoderCount = encoderCount + change;
+}
+
+//goto encoder position
+void gotoPosition(int position){
+  
+}
+
+// Function to check if a string is a valid number
+bool isNumber(String str) {
+  // Return false if the string is empty
+  if (str.length() == 0) return false;
+
+  // Return false if the string is only a negative sign
+  if (str.equals("-")) return false;
+
+  // Return false if the string is only a decimal point
+  if (str.equals(".")) return false;
+
+  // Return false if the string is a negative sign followed by only a decimal point
+  if (str.equals("-.") || str.equals(".-")) return false;
+
+  // Convert the string to a char array
+  char charArray[str.length() + 1];
+  str.toCharArray(charArray, str.length() + 1);
+
+  bool hasDecimalPoint = false;
+  bool hasExponent = false;
+  bool hasDigits = false;
+  int startIdx = 0;
+
+  // Check for an optional leading minus sign
+  if (charArray[0] == '-') {
+    startIdx = 1;
+  }
+
+  for (int i = startIdx; i < str.length(); i++) {
+    if (isdigit(charArray[i])) {
+      hasDigits = true;
+    } else if (charArray[i] == '.' && !hasDecimalPoint && !hasExponent) {
+      hasDecimalPoint = true;
+    } else if ((charArray[i] == 'e' || charArray[i] == 'E') && !hasExponent && hasDigits) {
+      hasExponent = true;
+      hasDigits = false; // Need at least one digit after exponent
+      if (i + 1 < str.length() && (charArray[i + 1] == '+' || charArray[i + 1] == '-')) {
+        i++; // Skip the next character if it's a sign
+      }
+    } else {
+      return false; // Invalid character
+    }
+  }
+
+  return hasDigits;
+}

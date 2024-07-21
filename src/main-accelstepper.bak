@@ -1,0 +1,327 @@
+#include <Arduino.h>
+#include <AccelStepper.h>
+
+// Pin definitions
+#define PUL_PIN 25 // Pulse pin
+#define DIR_PIN 32 // Direction pin; HIGH = CW = UP; LOW = CCW = DOWN;
+#define ENA_PIN 33 // Enable pin
+#define TOPSTOP_PIN 16  // Top limit switch pin
+#define BOTSTOP_PIN 17  // Bottom limit switch pin
+
+#define MAXLIM 100 // either top (+MAXLIM) or bottom (-MAXLIM) position count (in mm)
+#define MAXOFFSET 2 // distance (mm) to move away from limit switch when hit
+#define TARGETTOL 0.4 // tolerance to arriving at target (1.0 mm is 1/5 of a rotation)
+#define MINPULSEDUR 15 // duration in microsec for pulse
+#define DELAYDUR 100 // pause after discrete mode changes
+#define REVERSE_PAUSE 10 // pause after direction change
+#define NUMLOOPS 1 // number of up-down cycles in loop mode
+#define NUMROT 1 // number of rotations per iteration (up or down)
+
+#define DEBOUNCE_COUNT_MIN 5 // debounce count for limit switches
+
+volatile bool topSwJustActivated = false;
+volatile bool bottomSwJustActivated = false;
+
+// Declare the limit switch states as volatile
+volatile bool topSwitchState = false;
+volatile bool bottomSwitchState = false;
+volatile int limitSwitchStatus = 0; // combined value
+
+// Declare the last and debounced switch states
+volatile int lastTopSwitchFalseCount = 0;
+volatile int lastBottomSwitchFalseCount = 0;
+
+volatile int position = 0;   // the relative position in 0.2 mm increments
+volatile int targetPosition = 0;   // the position being targeted
+volatile bool direction_up;  // direction of travel; true = HIGH = UP, false = LOW = down;
+
+long lastUpdateTime = 0;
+
+// State machine modes
+const int MODE_UP = 1;
+const int MODE_DOWN = 2;
+const int MODE_LOOP = 3;
+const int MODE_STOP = 4;
+const int MODE_RUN = 5;
+int currentMode = MODE_STOP; // Default to STOP mode
+int countLoopsPerSecond = 0;
+
+// AccelStepper instance
+AccelStepper stepper(AccelStepper::DRIVER, PUL_PIN, DIR_PIN);
+
+// Function declarations
+void modeRunFunction();
+void modeStopFunction();
+void updatePosition(int);
+void gotoPosition(int);
+void reverseDir();
+void hitTopStop();
+void hitBottomStop();
+void showLimitSwitches();
+int getLimitSwStatus();
+void checkSerial();
+void IRAM_ATTR topSwitchISR();
+void IRAM_ATTR bottomSwitchISR();
+bool readTopLimitSw();
+bool readBottomLimitSw();
+
+void setup() {
+  // Control pins
+  pinMode(ENA_PIN, OUTPUT);
+  digitalWrite(ENA_PIN, LOW); // Enable the stepper driver
+
+  // Initialize the limit switch pins as inputs with internal pull-up resistors
+  pinMode(TOPSTOP_PIN, INPUT_PULLUP);
+  pinMode(BOTSTOP_PIN, INPUT_PULLUP);
+
+  // Attach interrupts to the limit switch pins
+  attachInterrupt(digitalPinToInterrupt(TOPSTOP_PIN), topSwitchISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BOTSTOP_PIN), bottomSwitchISR, FALLING);
+  
+  // Set initial direction
+  direction_up = false; // false = down
+
+  // Initialize serial communication 
+  Serial.begin(250000);
+  
+  // Initialize stepper
+  stepper.setMaxSpeed(1000); // Adjust as needed
+  stepper.setAcceleration(200); // Adjust as needed
+
+  // Give some time to the serial monitor to initialize
+  delay(1000);
+}
+
+void loop() { 
+  limitSwitchStatus = getLimitSwStatus();
+  countLoopsPerSecond++;
+  checkSerial();
+
+  // Determine if time for displaying data
+  unsigned long currentTime = millis();
+  unsigned long elapsedTime = currentTime - lastUpdateTime;
+  
+  if (elapsedTime >= 1000) { // Update info every second
+    noInterrupts();
+    lastUpdateTime = currentTime;
+    interrupts();
+    showLimitSwitches();
+    Serial.print("Position (mm): ");
+    Serial.print(position / 5.0);
+    Serial.print(". Elapsed Time (msec): ");
+    Serial.print(elapsedTime);
+    Serial.print(". # of loops: ");
+    Serial.println(countLoopsPerSecond);
+    countLoopsPerSecond = 0;
+  }
+
+  // State machine handling different modes
+  switch (currentMode) {
+    case MODE_RUN:
+      modeRunFunction();
+      break;
+    case MODE_STOP:
+      modeStopFunction();
+      break;
+    default:
+      Serial.println("Invalid mode");
+      break;
+  }
+
+  stepper.run();
+}
+
+// Function to check the limit switches
+void showLimitSwitches() {
+  // Get the limit switch status
+  int status = getLimitSwStatus();
+  
+  // Print the status
+  switch (status) {
+    case 0:
+      Serial.println("Both limit switches INACTIVE.");
+      break;
+    case 1:
+      Serial.println("Top limit switch ACTIVE.");
+      break;
+    case -1:
+      Serial.println("Bottom limit switch ACTIVE.");
+      break;
+    default:
+      Serial.println("ERROR: Both limit switches ACTIVE.");
+      break;
+  }
+}
+
+// Function to check the status of the limit switches
+int getLimitSwStatus() {
+  // Debounce top switch change to inactive
+  if (topSwitchState) {
+    if (topSwJustActivated) {
+      // Reset false count to restart debounce count for INACTIVE
+      lastTopSwitchFalseCount = 0; 
+      hitTopStop();
+      topSwJustActivated = false;
+    }
+    if (lastTopSwitchFalseCount < DEBOUNCE_COUNT_MIN) {
+      if (!readTopLimitSw()) {
+        lastTopSwitchFalseCount++;
+      } else {
+        lastTopSwitchFalseCount = 0;
+      }
+    } else {
+      topSwitchState = false;
+    }
+  }
+  // Debounce bottom switch change to inactive
+  if (bottomSwitchState) {
+    if (bottomSwJustActivated) {
+      // Reset false count to restart debounce count for INACTIVE
+      lastBottomSwitchFalseCount = 0; 
+      hitBottomStop();
+      bottomSwJustActivated = false;
+    }
+    if (lastBottomSwitchFalseCount < DEBOUNCE_COUNT_MIN) {
+      if (!readBottomLimitSw()) {
+        lastBottomSwitchFalseCount++;
+      } else {
+        lastBottomSwitchFalseCount = 0;
+      }
+    } else {
+      bottomSwitchState = false;
+    }
+  }
+
+  if (!topSwitchState && !bottomSwitchState) {
+    return 0;  // Both open
+  } else if (!topSwitchState && bottomSwitchState) {
+    return -1;  // Top limit ACTIVE
+  } else if (topSwitchState && !bottomSwitchState) {
+    return 1; // Bottom limit ACTIVE
+  } else {
+    return -2; // Both ACTIVE
+  }
+}
+
+// Return true if top limit switch is active
+bool readTopLimitSw() {
+  return digitalRead(TOPSTOP_PIN) == LOW; // Active LOW
+}
+
+// Return true if bottom limit switch is active
+bool readBottomLimitSw() {
+  return digitalRead(BOTSTOP_PIN) == LOW; // Active LOW
+}
+
+// ISR for the top limit switch - called on falling to low (ACTIVATED)
+void IRAM_ATTR topSwitchISR() {
+  topSwitchState = true;
+  topSwJustActivated = true;
+}
+
+// ISR for the bottom limit switch - called on falling to low (ACTIVATED)
+void IRAM_ATTR bottomSwitchISR() {
+  bottomSwitchState = true;
+  lastBottomSwitchFalseCount = 0; // Reset false count to restart debounce count for INACTIVE
+  bottomSwJustActivated = true;
+}
+
+// Function to run toward a target position
+void modeRunFunction() {
+  if (abs(position - targetPosition) > TARGETTOL) {
+    // Move towards target position
+    stepper.moveTo(targetPosition * 5); // Convert to 0.2 mm increments
+    if (direction_up) {
+      updatePosition(1);
+    } else {
+      updatePosition(-1);
+    }
+  } else {
+    currentMode = MODE_STOP;
+  }
+}
+
+// Stopped, do nothing
+void modeStopFunction() {
+  // Code for mode STOP
+}
+
+// Update the position following movement
+void updatePosition(int change) {
+  position += change;
+}
+
+// Go to new target position
+void gotoPosition(int newPosition) {
+  if (newPosition > MAXLIM) {
+    targetPosition = MAXLIM;
+  } else if (newPosition < -MAXLIM) {
+    targetPosition = -MAXLIM;
+  } else {
+    targetPosition = newPosition;
+  }
+  Serial.print("Target: ");
+  Serial.println(targetPosition);
+  if (((targetPosition > position) && !direction_up) || ((targetPosition < position) && direction_up)) {
+    reverseDir();
+  } 
+}
+
+// Function to decel, pause pulses, and reverse direction
+void reverseDir() {
+  Serial.print("Reversing. Shifting to ");
+  if (direction_up) {
+    Serial.println("down.");
+  } else {
+    Serial.println("up.");
+  }
+  direction_up = !direction_up;
+  stepper.setCurrentPosition(0);
+  stepper.setSpeed((direction_up ? 1 : -1) * stepper.maxSpeed());
+}
+
+// Handle hitting the top limit switch
+void hitTopStop() {
+  Serial.println("HIT TOP STOP.");
+  gotoPosition(MAXLIM - MAXOFFSET);
+}
+
+// Handle hitting the bottom limit switch
+void hitBottomStop() {
+  Serial.println("HIT BOTTOM STOP.");
+  gotoPosition(-MAXLIM + MAXOFFSET);
+}
+
+// Check serial input for commands
+void checkSerial() {
+  if (Serial.available() > 0) {
+    char command = Serial.read();
+    switch (command) {
+      case 'u':
+        Serial.println("MODE: UP.");
+        targetPosition = MAXLIM;
+        currentMode = MODE_RUN;
+        break;
+      case 'd':
+        Serial.println("MODE: DOWN.");
+        targetPosition = -MAXLIM;
+        currentMode = MODE_RUN;
+        break;
+      case 'r':
+        Serial.println("MODE: LOOP.");
+        currentMode = MODE_LOOP;
+        break;
+      case 's':
+        Serial.println("MODE: STOP.");
+        currentMode = MODE_STOP;
+        break;
+      case 'p':
+        Serial.print("POSITION: ");
+        Serial.println(position);
+        break;
+      default:
+        Serial.println("Unknown command");
+        break;
+    }
+  }
+}

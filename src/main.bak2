@@ -1,0 +1,549 @@
+//TODO - make this work for 2 actuators
+
+#include <Arduino.h>
+
+#define PUL_PIN 25 // Pulse pin
+#define DIR_PIN 32 // Direction pin; HIGH = CW = UP; LOW = CCW = DOWN;
+#define ENA_PIN 33 // Enable pin
+#define TOPSTOP_PIN 16  // Top limit sw pin
+#define BOTSTOP_PIN 17  // Bottom limit sw pin
+
+#define MAXLIM 100 //either top (+MAXLIM) or bottom (-MAXLIM) position count (in mm)
+#define MAXOFFSET 5 //distance (mm) to move away from limit switch when hit
+#define TARGETTOL 0.4 //tolerance to ariving at target (1.0 mm is 1/5 of a rotation)
+#define MINPULSEDUR 15 //duration in microsec for pulse (f=1/(2*MINPULSEDUR). 20 for T=40, f=25kHz.
+#define DELAYDUR 100 //pause after discrete mode changes
+#define REVERSE_PAUSE 10 //pause after direction change
+#define NUMLOOPS 1 //number of up-down cycles in loop mode
+#define NUMROT 1 //number of rotations per iterations (up or down); 5 ~= 1" (5.08 rotations for 5mm pitch = 1")
+
+
+//LIMIT SWITCH VARIABLES
+// Debounce for number of cycles before changing to inactive state (HIGH)
+// on FALLING to LOW the state change is immediate (no debounce) since 
+// on endstop contact you want to stop immediately
+#define DEBOUNCE_COUNT_MIN 5 //number of reads before state change to INACTIVE
+volatile bool topSwJustActivated = false;
+volatile bool bottomSwJustActivated = false;
+
+// Declare the limit switch states as volatile
+volatile bool topSwitchState = false; 
+volatile bool bottomSwitchState = false; 
+volatile int limitSwitchStatus = 0; //combined value
+
+// Declare the last and debounced switch states
+volatile int lastTopSwitchFalseCount = 0;
+volatile int lastBottomSwitchFalseCount = 0;
+
+//MOTOR SETUP
+const int microsteps = 4; // Number of microsteps per step
+const int stepsPerRevolution = 200; // Full steps per revolution for your motor
+
+volatile int position = 0;   //the relative position in mm
+volatile int targetPosition = 0;   //the position being targetted
+volatile int current_pulse_duration = MINPULSEDUR;  //the current pulse duration
+volatile bool direction_up;  //direction of travel; true = HIGH = UP, false = LOW = down;
+long lastUpdateTime = 0;
+
+//STATE MACHINE MODES
+const int MODE_UP = 1;
+const int MODE_DOWN = 2;
+const int MODE_LOOP = 3;
+const int MODE_STOP = 4;
+const int MODE_RUN = 5;
+int currentMode = MODE_STOP; // Default to STOP model
+
+//function declarations
+void modeUpFunction();
+void modeDownFunction();
+void modeLoopFunction();
+void modeStopFunction();
+void modeHoldFunction();
+void modeRunFunction();
+void updatePosition(int);
+void gotoPosition(int);
+bool isNumber(String);
+void reverseDir(); //function to decel, pause pulses, and reverse direction
+void hitTopStop(); //function to stop if top limit switch hit
+void hitBottomStop(); //function to stop if bottom limit switch hit 
+void listenSerialTask(void * parameter);
+void checkLimitSwitchesTask(void * parameter);
+void showLimitSwitches();
+int getLimitSwStatus();
+void pulse_uSteps(int uSteps);
+void IRAM_ATTR topSwitchISR();
+void IRAM_ATTR bottomSwitchISR();
+bool readTopLimitSw(); //shut = false
+bool readBottomLimitSw(); //shut = false
+
+void setup() {
+  //control pins
+  pinMode(PUL_PIN, OUTPUT);
+  pinMode(DIR_PIN, OUTPUT);
+  pinMode(ENA_PIN, OUTPUT);
+
+  // Initialize the limit switch pins as inputs with internal pull-up resistors
+  pinMode(TOPSTOP_PIN, INPUT_PULLUP);
+  pinMode(BOTSTOP_PIN, INPUT_PULLUP);
+
+  // Attach interrupts to the limit switch pins that only detect activation
+  attachInterrupt(digitalPinToInterrupt(TOPSTOP_PIN), topSwitchISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BOTSTOP_PIN), bottomSwitchISR, FALLING);
+  
+  //Set initial direction
+  digitalWrite(DIR_PIN, LOW); //LOW = down
+  direction_up = false;       //false = down
+
+  // Initialize serial communication 
+  Serial.begin(115200);
+  
+  // Give some time to the serial monitor to initialize
+  delay(1000);
+
+  // TODO - this is a function for testing using serial monitor input
+  // Create the FreeRTOS task for listening to serial input
+  xTaskCreate(
+    listenSerialTask,   // Function that should be called
+    "ListenSerial",     // Name of the task (for debugging)
+    10000,              // Stack size (bytes)
+    NULL,               // Parameter to pass
+    1,                  // Task priority
+    NULL                // Task handle
+  );
+  
+  Serial.println("Enter 'U', 'D', 'L', 'S', or a numeric target position to change modes.");
+  //--------------------------------
+
+  //TODO for real streaming from SimTools with 2 16 bit numbers (1 for each of 2 actuators)
+  // use this:
+  // Create the FreeRTOS task for listening to serial input
+  // xTaskCreate(
+  //   listenSerialTaskSimTools,
+  //   "ListenSerial",     // Name of the task (for debugging)
+  //   10000,              // Stack size (bytes)
+  //   NULL,               // Parameter to pass
+  //   1,                  // Task priority
+  //   NULL                // Task handle
+  // );
+  
+  //--------------------------------
+
+}
+
+void loop() { 
+  limitSwitchStatus = getLimitSwStatus();
+
+  //determine if time for displaying data
+  unsigned long currentTime = millis();
+  unsigned long elapsedTime = currentTime - lastUpdateTime;
+  if (elapsedTime >= 1000) { // Update info every second
+    noInterrupts();
+    lastUpdateTime = currentTime;
+    interrupts();
+    showLimitSwitches();
+    Serial.print("Position (mm): ");
+    Serial.println(position);
+  }
+
+  // State machine handling different modes
+  switch (currentMode) {
+    case MODE_RUN:
+      modeRunFunction();
+      break;
+    case MODE_UP:
+      modeUpFunction();
+      break;
+    case MODE_DOWN:
+      modeDownFunction();
+      break;
+    case MODE_LOOP:
+      modeLoopFunction();
+      break;
+    case MODE_STOP:
+      modeStopFunction();
+      break;
+    default:
+      Serial.println("Invalid mode");
+      break;
+  }
+
+}
+
+// Function to check the limit switches
+void showLimitSwitches() {
+    // Get the limit switch status
+    int status = getLimitSwStatus();
+    // Print the status
+    switch (status) {
+      case 0:
+        Serial.println("Both limit switches INACTIVE.");
+        break;
+      case 1:
+        Serial.println("Top limit switch ACTIVE.");
+        break;
+      case -1:
+        Serial.println("Bottom limit switch ACTIVE.");
+        break;
+      default:
+        Serial.println("ERROR: Both limit switches ACTIVE.");
+        break;
+    }
+}
+
+/*
+Function to check the status of the limit switches:
+return 0 if both inactive, 
+return 1 if top limit active, 
+return -1 if bottom active, 
+return -2 if both active.
+*/
+int getLimitSwStatus() {
+  //debounce top switch change to inactive
+  if(topSwitchState){
+    if(topSwJustActivated){
+      //reset false count to restart debounce count for INACTIVE
+      lastTopSwitchFalseCount = 0; 
+      hitTopStop();
+      topSwJustActivated = false;
+    }
+    if(lastTopSwitchFalseCount<DEBOUNCE_COUNT_MIN){
+      if(!readTopLimitSw()){
+        lastTopSwitchFalseCount++;
+      }else{
+        lastTopSwitchFalseCount=0;
+      }
+    }else{
+      topSwitchState = false;
+    }
+  }
+  //debounce bottom switch change to inactive
+  if(bottomSwitchState){
+    if(bottomSwJustActivated){
+      //reset false count to restart debounce count for INACTIVE
+      lastBottomSwitchFalseCount = 0; 
+      hitBottomStop();
+      bottomSwJustActivated = false;
+    }
+    if(lastBottomSwitchFalseCount<DEBOUNCE_COUNT_MIN){
+      if(!readBottomLimitSw()){
+        lastBottomSwitchFalseCount++;
+      }else{
+        lastBottomSwitchFalseCount=0;
+      }
+    }else{
+      bottomSwitchState = false;
+    }
+  }
+
+  if (!topSwitchState && !bottomSwitchState) {
+    return 0;  // Both open
+  } else if (!topSwitchState && bottomSwitchState) {
+    return -1;  // Top limit ACTIVE
+  } else if (topSwitchState && !bottomSwitchState) {
+    return 1; // Bottom limit ACTIVE
+  } else {
+    return -2; // Both ACTIVE
+  }
+}
+
+//Return true if top limit switch is active
+bool readTopLimitSw(){
+  return digitalRead(TOPSTOP_PIN) == LOW; // Active LOW, 
+}
+
+//Return true if bottom limit switch is active
+bool readBottomLimitSw(){
+  return digitalRead(BOTSTOP_PIN) == LOW; // Active LOW
+}
+
+// ISR for the top limit switch - called on falling to low (ACTIVATED)
+void IRAM_ATTR topSwitchISR() {
+  topSwitchState = true;
+  topSwJustActivated = true;
+}
+
+// ISR for the bottom limit switch - called on falling to low (ACTIVATED)
+void IRAM_ATTR bottomSwitchISR() {
+  bottomSwitchState = true;
+  lastBottomSwitchFalseCount = 0; //reset false count to restart debounce count for INACTIVE
+  bottomSwJustActivated = true;
+}
+
+//move motor the number of microsteps provided (800 is one rotation)
+void pulse_uSteps(int uSteps){
+ for (int i = 0; i < (int)(uSteps); i++) { // Total microsteps
+    digitalWrite(PUL_PIN, HIGH);
+    delayMicroseconds(MINPULSEDUR); // Adjust as needed for your motor and driver
+    digitalWrite(PUL_PIN, LOW);
+    delayMicroseconds(MINPULSEDUR);
+  }
+}
+
+//function to run toward a taregt position
+void modeRunFunction() {
+  // Code for mode RUN
+  Serial.print("run");
+  /*
+   TODO:
+   Outline for running mode:
+
+         - if only one limit switch is closed verify that the direction_pin is moving away from limit and pulse once and increment/decrement position
+
+         - elif check if target and current position are not within tolerance (if at target w/in tol then set mode to stop and exit)
+         - elif determine if direction reversed based on target vs position
+         - elif [maybe: update pulse rate (P setting)] and pulse and increment/decrement position
+  */
+  
+  if(abs(position-targetPosition) > TARGETTOL){
+    //TODO - test with mm - move a mm at a time 
+    pulse_uSteps(160);
+
+    if(direction_up){
+      updatePosition(1);
+    }else{
+      updatePosition(-1);
+    }
+  }else{
+    currentMode = MODE_STOP;
+  }
+
+}
+
+//discrete move up at max speed for preset number of rotations
+void modeUpFunction() {
+  // Code for mode UP
+  Serial.println(" (UP)");
+  // Set direction
+  digitalWrite(DIR_PIN, HIGH); // Set direction to clockwise
+  pulse_uSteps((int)(NUMROT * stepsPerRevolution * microsteps));
+  updatePosition(NUMROT*5);
+  delay(DELAYDUR);  // Pause
+}
+
+//discrete move down at max speed for preset number of rotations
+void modeDownFunction() {
+  // Code for mode DOWN
+  Serial.println(" (DOWN)");
+  // Change direction
+  digitalWrite(DIR_PIN, LOW); // Set direction to counterclockwise
+  pulse_uSteps((int)(NUMROT * stepsPerRevolution * microsteps));
+  updatePosition(-5*NUMROT);
+  delay(DELAYDUR); // Pause
+}
+
+//discrete move up and down at max speed for preset number of rotations in each direction for a preset number of loops
+void modeLoopFunction() {
+  // Code for mode LOOP
+  Serial.println(" (LOOP)");
+  for (int i = 0; i < NUMLOOPS; i++) { // Total microsteps
+    modeUpFunction();
+    modeDownFunction();
+  }
+  delay(DELAYDUR); // Pause
+}
+
+//Stopped, do nothing
+void modeStopFunction() {
+  // Code for mode STOP
+  // Serial.println(" (STOP)");
+}
+
+//update the position following movement
+//position is in [mm] running from -MAXLIM to +MAXLIM (notionally -100 to 100 with 0 parked)
+void updatePosition(int change) {
+  position = position + change;
+}
+
+//goto new target position
+void gotoPosition(int newPosition){
+  /*
+  TODO:
+  - verify a limit switch isn't closed
+  --- if it is don't update target unless it is further away from limit than curent position; then exit.
+  --- if it is not then do what is below
+  */
+
+  if(newPosition > MAXLIM){
+    targetPosition = MAXLIM;
+  }else if(newPosition < -MAXLIM){
+    targetPosition = -MAXLIM;
+  }else{
+    targetPosition = newPosition;
+  }
+  Serial.print("Target: ");
+  Serial.println(targetPosition);
+  if(((targetPosition > position) && !direction_up)||((targetPosition < position) && direction_up)){
+    reverseDir();
+  } 
+}
+
+ //function to decel, pause pulses, and reverse direction
+void reverseDir(){
+  Serial.print("Reversing. Shifting to ");
+  if(direction_up){Serial.println("down.");}else{Serial.println("up.");}
+  /*
+  Outline:
+   -wait REVERSE_PAUSE with no pulse
+   -reverse direction (flip 'direction_up' and set DIR_PIN to HIGH/LOW accordingly)
+   -wait REVERSE_PAUSE with no pulse 
+
+   TODO - STILL NEED TO DO THIS:
+   -do one slow pulse (2*current_pulse_duration)
+  */
+  delayMicroseconds(REVERSE_PAUSE);
+  direction_up = !direction_up;
+  if(direction_up){
+    digitalWrite(DIR_PIN, HIGH);
+  }else{
+    digitalWrite(DIR_PIN, LOW);
+  }
+  delayMicroseconds(REVERSE_PAUSE);
+  if(direction_up){Serial.println("Now going up.");}else{Serial.println("Now going down.");}
+
+}
+
+//function to stop if top limit switch hit 
+void hitTopStop(){
+  Serial.println("Top Limit Switch Hit");
+  /*
+  TODO Outline:
+  1. This is on "on falling" function call - so the switch was just activated 
+
+  TODO UPDAte this logic for falling isr - may need to debounce with a few cycles (seeing some noise)
+    a. if the switch is closed (just hit the limit while moving toward physical end):
+        - set direction pin to move away from limit switch
+        - pause for REVERSE_PAUSE
+        - do a slow pulse (2*current_pulse_duration)
+    b. if the switch just opened then assume we were moving off the limit and we just cleared.
+        - update position to equal the MAX
+        - set targetPosition to MAX
+  */
+}
+
+//function to stop if top limit switch hit 
+void hitBottomStop(){
+  Serial.println("Bottom Limit Switch Hit");
+  /*
+  TODO Outline:
+    1. This is on "on falling" function call - so the switch was just activated 
+
+  TODO UPDAte this logic for falling isr - may need to debounce with a few cycles (seeing some noise)
+
+    a. if the switch is closed (just hit the limit while moving toward physical end):
+        - set direction pin to move away from limit switch
+        - pause for REVERSE_PAUSE
+        - do a slow pulse (2*current_pulse_duration)
+    b. if the switch just opened then assume we were moving off the limit and we just cleared.
+        - update position to equal the MAX
+        - set targetPosition to MAX
+  */
+}
+
+// Function to check if a string is a valid number
+bool isNumber(String str) {
+  // Return false if the string is empty
+  if (str.length() == 0) return false;
+
+  // Return false if the string is only a negative sign
+  if (str.equals("-")) return false;
+
+  // Return false if the string is only a decimal point
+  if (str.equals(".")) return false;
+
+  // Return false if the string is a negative sign followed by only a decimal point
+  if (str.equals("-.") || str.equals(".-")) return false;
+
+  // Convert the string to a char array
+  char charArray[str.length() + 1];
+  str.toCharArray(charArray, str.length() + 1);
+
+  bool hasDecimalPoint = false;
+  bool hasExponent = false;
+  bool hasDigits = false;
+  int startIdx = 0;
+
+  // Check for an optional leading minus sign
+  if (charArray[0] == '-') {
+    startIdx = 1;
+  }
+
+  for (int i = startIdx; i < str.length(); i++) {
+    if (isdigit(charArray[i])) {
+      hasDigits = true;
+    } else if (charArray[i] == '.' && !hasDecimalPoint && !hasExponent) {
+      hasDecimalPoint = true;
+    } else if ((charArray[i] == 'e' || charArray[i] == 'E') && !hasExponent && hasDigits) {
+      hasExponent = true;
+      hasDigits = false; // Need at least one digit after exponent
+      if (i + 1 < str.length() && (charArray[i + 1] == '+' || charArray[i + 1] == '-')) {
+        i++; // Skip the next character if it's a sign
+      }
+    } else {
+      return false; // Invalid character
+    }
+  }
+  return hasDigits;
+}
+
+// Task function to listen for serial input
+// This function is for testing.  Takes a number or commands.
+void listenSerialTask(void * parameter) {
+  while (true) {
+    if (Serial.available() > 0) {
+      // Read the incoming byte
+      String input = Serial.readStringUntil('\n');
+
+      // Change mode based on input
+      if(input.toInt()){
+        currentMode = MODE_RUN;
+        gotoPosition(input.toInt());
+      }else if (input.equalsIgnoreCase("U")) {
+        currentMode = MODE_UP;
+        Serial.println("Changed to Mode UP");
+      } else if (input.equalsIgnoreCase("D")) {
+        currentMode = MODE_DOWN;
+        Serial.println("Changed to Mode DOWN");
+      } else if (input.equalsIgnoreCase("L")) {
+        currentMode = MODE_LOOP;
+        Serial.println("Changed to Mode LOOP");
+      } else if (input.equalsIgnoreCase("S")) {
+        currentMode = MODE_STOP;
+        Serial.println("Changed to Mode STOP");
+      } else {
+        Serial.println("Unknown command. Please enter 'U', 'D', 'L', 'S', or a target position.");
+      }
+    }
+
+    // Add a small delay to prevent overwhelming the CPU
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+
+// Task function to listen for serial input for SimTool position streams
+// SimTools should be set to stream 2 16-bit numbers with no separators
+// each number corresponds to a position of one actuator running from
+// -100mm to +100mm (200 mm range)
+// 200mm/5mm pitch = 40 rotations. 
+// 800 steps per rotation = 32000 pulses over range. 
+void listenSerialTaskSimTools(void * parameter) {
+  while (true) {
+    // Check if there are at least 4 bytes available to read
+    if (Serial.available() >= 4) {
+      // Read the first 2-byte number
+      uint16_t num1 = Serial.read() | (Serial.read() << 8);
+      
+      // Read the second 2-byte number
+      uint16_t num2 = Serial.read() | (Serial.read() << 8);
+      
+      // Print the received numbers
+      Serial.print("Received numbers: ");
+      Serial.print(num1);
+      Serial.print(", ");
+      Serial.println(num2);
+    }
+
+    // Add a small delay to prevent overwhelming the CPU
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
