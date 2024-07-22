@@ -1,0 +1,17 @@
+pfodESP32Utils	KEYWORD1
+pfodESP32BufferedClient	KEYWORD1
+strncpy_safe	KEYWORD2
+urldecode2	KEYWORD2
+parseLong	KEYWORD2
+isEmpty	KEYWORD2
+ipStrToNum	KEYWORD2
+connect	KEYWORD2
+write	KEYWORD2
+availableForWrite	KEYWORD2
+available	KEYWORD2
+read	KEYWORD2
+peek	KEYWORD2
+flush	KEYWORD2
+stop	KEYWORD2
+connected	KEYWORD2
+setDebugStream	KEYWORD2

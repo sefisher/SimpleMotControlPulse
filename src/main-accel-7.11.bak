@@ -17,7 +17,7 @@ and -(MAXLIM+MAXOFFSET) respectively.
 //#define CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID
 
 #include <Arduino.h>
-#include <AccelStepper.h>
+#include "FastAccelStepper.h"
 #include "UltimateDebounce.h"
 // #include "freertos/FreeRTOS.h"
 // #include "freertos/task.h"

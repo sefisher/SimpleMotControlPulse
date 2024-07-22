@@ -1,8 +1,8 @@
 #include <Arduino.h>
 
-#define PUL_PIN 25 // Pulse pin
-#define DIR_PIN 32 // Direction pin
-#define ENA_PIN 33 // Enable pin
+#define PUL_PIN 17 // Pulse pin
+#define DIR_PIN 18 // Direction pin
+#define ENA_PIN 13 // Enable pin
 
 // #define EA_PLUS_PIN 16   // Example pin for EA+
 // #define EA_MINUS_PIN 17  // Example pin for EA-
@@ -62,7 +62,7 @@ void setup() {
   
   digitalWrite(ENA_PIN, LOW); // Enable the driver (active low)
   // Initialize serial communication at 9600 baud rate
-  Serial.begin(115200);
+  Serial.begin(250000);
   Serial.println("Enter 'U', 'D', 'L', 'S', or 'H' to change modes.");
 }
 

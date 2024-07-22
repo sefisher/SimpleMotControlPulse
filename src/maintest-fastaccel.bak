@@ -1,0 +1,46 @@
+#include <Arduino.h>
+#include "FastAccelStepper.h"
+
+// As in StepperDemo for Motor 1 on AVR
+//#define dirPinStepper    5
+//#define enablePinStepper 6
+//#define stepPinStepper   9  // OC1A in case of AVR
+
+// As in StepperDemo for Motor 1 on ESP32
+#define stepPinStepper 17
+#define dirPinStepper 18
+#define enablePinStepper 13
+
+
+FastAccelStepperEngine engine = FastAccelStepperEngine();
+FastAccelStepper *stepper = NULL;
+
+int targetpos=1000;
+
+void setup() {
+  Serial.begin(250000);
+  engine.init();
+  stepper = engine.stepperConnectToPin(stepPinStepper);
+  if (stepper) {
+    stepper->setDirectionPin(dirPinStepper);
+    stepper->setEnablePin(enablePinStepper);
+    stepper->setAutoEnable(false);
+
+    // If auto enable/disable need delays, just add (one or both):
+    stepper->setDelayToEnable(50);
+    stepper->setDelayToDisable(1000);
+
+    stepper->setSpeedInUs(1000);  // the parameter is us/step !!!
+    stepper->setAcceleration(100);
+    stepper->enable
+    stepper->move(targetpos);
+  }
+}
+
+
+void loop() {
+  delay(3000);
+  Serial.print("swap");
+  targetpos = -targetpos;
+  stepper->move(targetpos);
+}

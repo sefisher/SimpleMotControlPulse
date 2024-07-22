@@ -2,11 +2,11 @@
 
 #include <Arduino.h>
 
-#define PUL_PIN 25 // Pulse pin
-#define DIR_PIN 32 // Direction pin; HIGH = CW = UP; LOW = CCW = DOWN;
-#define ENA_PIN 33 // Enable pin
-#define TOPSTOP_PIN 16  // Top limit sw pin
-#define BOTSTOP_PIN 17  // Bottom limit sw pin
+#define PUL_PIN 17 // Pulse pin
+#define DIR_PIN 18 // Direction pin; HIGH = CW = UP; LOW = CCW = DOWN;
+#define ENA_PIN 13 // Enable pin
+#define TOPSTOP_PIN 15  // Top limit sw pin
+#define BOTSTOP_PIN 4  // Bottom limit sw pin
 
 #define MAXLIM 100 //either top (+MAXLIM) or bottom (-MAXLIM) position count (in mm)
 #define MAXOFFSET 2 //distance (mm) to move away from limit switch when hit
